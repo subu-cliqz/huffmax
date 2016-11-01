@@ -8,7 +8,7 @@ import time
 
 batch_size = 32
 input_dim = 100
-nb_classes = 100000
+nb_classes = 50000
 nb_samples = 10000
 
 
@@ -21,18 +21,21 @@ model.predict(X[:1])
 start_time = time.time()
 model.predict(X)
 end_time = time.time()
+print model.predict(X)
 
 softmax_time = end_time - start_time
 
 
-
+print "Starting to compile Huffmax model"
 model = Sequential()
 model.add(HuffmaxClassifier(nb_classes, input_dim=input_dim, verbose=True))
 model.predict(X[:1])
+print "Compile Huffmax done."
 
 start_time = time.time()
 model.predict(X)
 end_time = time.time()
+print model.predict(X)
 
 huffmax_time = end_time - start_time
 
