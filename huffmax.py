@@ -10,6 +10,7 @@ import warnings
 import sys
 import datetime
 sys.setrecursionlimit(10000000)
+import tensorflow as tf
 
 def zeros(n):
     if K._BACKEND == 'theano':
@@ -18,7 +19,6 @@ def zeros(n):
     elif K._BACKEND == 'tensorflow':
         import tensorflow as tf
         return tf.zeros(n)
-
 
 class HuffmanNode(object):
     def __init__(self, node_id = -1, left=None, right=None):
@@ -47,7 +47,7 @@ class Huffmax(Layer):
         '''
         self.nb_classes = nb_classes
         if not frequencies:
-                frequencies = [(1, i)  for i in range(nb_classes)]
+                frequencies = [(i+1, i)  for i in range(nb_classes)]
         self.frequencies = frequencies
         self.init = initializations.get(init)
         self.W_regularizer = regularizers.get(W_regularizer)
@@ -59,8 +59,6 @@ class Huffmax(Layer):
         self.initial_weights = weights
         self.verbose = verbose
         self.huffman_codes = []
-        # Generate leaves of Huffman tree.
-        self.leaves = [Lambda(lambda x: K.cast(x * 0 + i, dtype='int32')) for i in range(self.nb_classes)]
         super(Huffmax, self).__init__(**kwargs)
 
     def build(self, input_shape):
@@ -68,7 +66,6 @@ class Huffmax(Layer):
             p = Queue.PriorityQueue()
             for value in frequencies:
                 p.put(value)
-
             node_id = 0
             while p.qsize() > 1:
                 l, r = p.get(), p.get()
@@ -77,14 +74,14 @@ class Huffmax(Layer):
                 p.put(node)
             return p.get()
 
-        def assign_codes(node, code_prefix=[], path_prefix = [], paths = {}, code={}):
+        def assign_nodes_data(node, code_prefix=[], path_prefix = [], paths = {}, code={}):
             if isinstance(node[1].left[1], HuffmanNode):
-                assign_codes(node[1].left,code_prefix+[0], path_prefix + [node[1].node_id], paths, code)
+                assign_nodes_data(node[1].left,code_prefix+[0], path_prefix + [node[1].node_id], paths, code)
             else:
                 code[node[1].left[1]] = code_prefix+[0]
                 paths[node[1].left[1]] = path_prefix+ [node[1].node_id]
             if isinstance(node[1].right[1],HuffmanNode):
-                assign_codes(node[1].right,code_prefix+[1], path_prefix + [node[1].node_id], paths, code)
+                assign_nodes_data(node[1].right,code_prefix+[1], path_prefix + [node[1].node_id], paths, code)
             else:
                 code[node[1].right[1]] = code_prefix+[1]
                 paths[node[1].right[1]] = path_prefix+[node[1].node_id]
@@ -105,7 +102,7 @@ class Huffmax(Layer):
             print('Building huffman tree...')
 
         self.root_node = create_huffman_tree(self.frequencies)
-        code_map, paths_map = assign_codes(self.root_node)
+        code_map, paths_map = assign_nodes_data(self.root_node)
 
         max_tree_depth = max(map(len, code_map.values()))
         self.huffman_codes = [x[1] for x in sorted(code_map.items())]
@@ -155,8 +152,6 @@ class Huffmax(Layer):
             self.set_weights(self.initial_weights)
             del self.initial_weights
         super(Huffmax, self).build(input_shape)
-        if self.verbose:
-            print('Done.')
 
 
     def call(self, x, mask=None):
@@ -171,12 +166,16 @@ class Huffmax(Layer):
         input_dim = self.input_spec[0].shape[1]
         req_nodes = K.gather(self.class_paths, target_classes)
         req_W = K.gather(self.W, req_nodes)
-        y = K.batch_dot(input_vector, req_W, axes=(1, 3))
+        y = None
+        if K._BACKEND == 'theano':
+            y = K.batch_dot(input_vector, req_W, axes=(1, 3))
+        else:
+            y = tf.einsum('ij,abcje->abce', input_vector, req_W)
         if self.bias:
             req_b = K.gather(self.b, req_nodes)
             y += req_b
         y = K.sigmoid(y[:, :, :, 0])
-        req_huffman_codes = K.gather(huffman_codes, target_classes)
+        req_huffman_codes = K.gather(self.huffman_codes, target_classes)
         return K.prod(req_huffman_codes + y - 2 * req_huffman_codes * y, axis=-1)  # Thug life
 
     def get_output_shape_for(self, input_shape):
@@ -184,7 +183,7 @@ class Huffmax(Layer):
 
     def get_config(self):
         config = {'nb_classes': self.nb_classes,
-                  'frequency_table': self.frequencies,
+                  'frequencies': self.frequencies,
                   'kwargs': self.kwargs
                   }
         base_config = super(Huffmax, self).get_config()
@@ -205,23 +204,27 @@ class HuffmaxClassifier(Huffmax):
     def call(self, x, mask=None):
 
         def get_node_w(node):
-            return self.W[self.node_indices[node], :, :]
+            return self.W[node.node_id, :, :]
 
         def get_node_b(node):
-            return self.b[self.node_indices[node], :]
+            return self.b[node.node_id, :]
 
         def compute_output(input, node=self.root_node):
-            if not hasattr(node, 'left'):
-                return zeros((K.shape(input)[0],)) + self.node_indices[node]
+            if not hasattr(node[1], 'left'):
+                return zeros((K.shape(input)[0],)) + node[0]
             else:
-                node_output = K.dot(x, get_node_w(node))
+                node_output = K.dot(x, get_node_w(node[1]))
                 if self.bias:
-                    node_output += get_node_b(node)
+                    node_output += get_node_b(node[1])
                 left_prob = node_output[:, 0]
                 right_prob = 1 - node_output[:, 0]
-                left_node_output = compute_output(input, node.left)
-                right_node_output = compute_output(input, node.right)
-                return K.switch(left_prob > right_prob, left_node_output, right_node_output)
+                left_node_output = compute_output(input, node[1].left)
+                right_node_output = compute_output(input, node[1].right)
+                if K._BACKEND == 'theano':
+                    return K.switch(left_prob > right_prob, left_node_output, right_node_output)
+                else:
+                    return tf.select(left_prob > right_prob, left_node_output, right_node_output)
+
         return K.cast(compute_output(x), 'int32')
 
     def get_output_shape_for(self, input_shape):
